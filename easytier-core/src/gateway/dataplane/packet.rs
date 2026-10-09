@@ -144,7 +144,20 @@ impl<V> FlowTable<V> {
                 };
                 (entry, Some(flags))
             }
-            ClassifiedPeerPacket::Udp { entry } => (entry, None),
+            ClassifiedPeerPacket::Udp { entry } => {			
+			let entry = if allow_tcp_listen_fallback && !self.contains_key(&entry) {
+				// Mirror the TCP listen fallback: an inbound datagram from an
+				// unknown peer must still match a bound UDP socket.
+				FlowKey {
+					src: entry.src,
+					dst: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+					kind: FlowKind::Udp,
+				}
+			} else {
+				entry
+			};
+			(entry, None)
+		}
             ClassifiedPeerPacket::FragmentedUdp { source } => {
                 return PeerPacketRoute::FragmentedUdp {
                     source,

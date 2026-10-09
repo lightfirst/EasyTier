@@ -17,6 +17,10 @@ pub struct DataPlaneUdpSocket {
     pub(super) flows: FlowSet,
     pub(super) routes: Mutex<HashMap<SocketAddr, FlowLease<FlowData>>>,
     pub(super) local_addr: SocketAddr,
+	/// Wildcard listen flow ({src: VIP:port, dst: 0.0.0.0:0, Udp}) registered on
+    /// bind so the first datagram from an unknown peer matches the flow table.
+    /// Dropped together with the socket.
+    pub(super) _listen_flow: FlowLease<FlowData>,
     pub(super) _reservation: Arc<dyn Any + Send + Sync>,
     pub(super) _data_plane_lease: DataPlaneLease,
     pub(super) generation: DataPlaneIoGuard,

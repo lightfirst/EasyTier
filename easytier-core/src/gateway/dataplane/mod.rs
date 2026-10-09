@@ -948,26 +948,68 @@ where
             local_port,
         ))
         .with_context(self.socket_context.clone());
-        let reservation = generation
+        // 主机端口预留失败（同机另一个实例已占用）→ 退化为随机端口预留。
+        // smoltcp 绑定在各实例自己的 VIP 上，同端口不冲突。
+        let reservation = match generation
             .while_open(deadline.run(self.host.bind_udp(reservation_options)))
-            .await?;
-        let reserved_port = reservation
-            .local_addr()
-            .map_err(DataPlaneError::from)?
-            .port();
-        let bind_addr = SocketAddr::new(IpAddr::V4(ipv4_addr.address()), reserved_port);
+            .await
+        {
+            Ok(res) => res,
+            Err(_) => {
+                tracing::warn!(
+                    "data-plane udp host port reservation failed for {}, \
+                     falling back to random (another instance on same machine?)",
+                    local_port
+                );
+                let fallback_options = UdpBindOptions::port_lease(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                    0, // 随机端口预留，仅保持 reservation 对象有效
+                ))
+                .with_context(self.socket_context.clone());
+                generation
+                    .while_open(deadline.run(self.host.bind_udp(fallback_options)))
+                    .await?
+            }
+        };
+        // smoltcp 始终绑定请求的端口（各实例 VIP 独立，不冲突）
+        let bind_addr = SocketAddr::new(IpAddr::V4(ipv4_addr.address()), local_port);
         let smol = generation
             .while_open(deadline.run(smoltcp_net.udp_bind(bind_addr)))
             .await?;
         generation.ensure_open()?;
-        let local_addr = smol.local_addr().map_err(DataPlaneError::from)?;
+        // ★ 使用我们显式构造的 bind_addr（VIP:port），而不是 smol.local_addr()。
+		// smoltcp 的 UDP 绑定可能忽略 IP 部分（绑到 0.0.0.0），导致
+		// 通配监听条目的 src 错误（0.0.0.0:48000），入站包的通配匹配失败。
+		let local_addr = bind_addr;
+		tracing::warn!("[DP] UDP bind: requested={:?}, smol_reported={:?}, wildcard_src={:?}",
+			bind_addr,
+			smol.local_addr().map(|a| a.to_string()).unwrap_or_default(),
+			local_addr);
+		let listen_flow = FlowLease::try_register(
+            self.entries.clone(),
+            FlowKey {
+                src: local_addr,
+                dst: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+                kind: UDP_ENTRY,
+            },
+            FlowData::Udp,
+        )
+        .ok_or_else(|| {
+            DataPlaneError::new(
+                DataPlaneErrorKind::AddressInUse,
+                format!("data-plane UDP listen flow already exists for {local_addr}"),
+            )
+        })?;
         let socket = Arc::new(DataPlaneUdpIo(smol));
 
+        eprintln!("[DP-DIAG] UDP BIND: vip={:?} port={} wildcard_src={:?} entries={}",
+            ipv4_addr, local_port, local_addr, self.entries.count());
         Ok(DataPlaneUdpSocket {
             socket,
             flows: self.entries.clone(),
             routes: std::sync::Mutex::new(std::collections::HashMap::new()),
             local_addr,
+			_listen_flow: listen_flow,
             _reservation: reservation,
             _data_plane_lease: data_plane_ref,
             generation,
